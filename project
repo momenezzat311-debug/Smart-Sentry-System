@@ -1,0 +1,176 @@
+import cv2
+import os
+import re
+import csv
+import pandas as pd
+import threading
+import requests
+import streamlit as st
+import face_recognition
+import numpy as np
+from ultralytics import YOLO
+from datetime import datetime
+
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
+TOKEN = '8736920287:AAEcyhdcVzP7Nka8myLvNFPSdlk_JIXlwnI'
+CHAT_ID = '886076378'
+
+ME_FOLDER = "me"
+for folder in [ME_FOLDER, "database", "detections"]:
+    os.makedirs(folder, exist_ok=True)
+
+# ============================================================
+# 2. ENHANCED FACE LOADING (Jittering enabled)
+# ============================================================
+
+@st.cache_resource
+def load_known_faces():
+    """Study photos intensely to create a better mathematical map."""
+    known_encodings = []
+    known_names = []
+    
+    valid_ext = ('.jpeg', '.jpg', '.png', '.jfif')
+    files = [f for f in os.listdir(ME_FOLDER) if f.lower().endswith(valid_ext)]
+    
+    if not files:
+        return [], []
+
+    for filename in files:
+        img_path = os.path.join(ME_FOLDER, filename)
+        img = face_recognition.load_image_file(img_path)
+        
+        # num_jitters=10 makes the loading MUCH more accurate for laptop webcams
+        encs = face_recognition.face_encodings(img, num_jitters=10, model="large")
+        if len(encs) > 0:
+            known_encodings.append(encs[0])
+            # Cleans 'momen_one.jpg' -> 'Momen'
+            name = re.sub(r'[\d_]+$', '', os.path.splitext(filename)[0]).replace('_', ' ').capitalize()
+            known_names.append(name.split()[0]) # Just take the first word 'Momen'
+                
+    return known_encodings, known_names
+
+# ============================================================
+# 3. IDENTIFICATION LOGIC (Tolerance 0.7)
+# ============================================================
+
+def identify_person(frame, box, known_encs, known_names):
+    x1, y1, x2, y2 = box
+    h, w = frame.shape[:2]
+    # Small padding helps the recognizer see your whole face structure
+    y1, y2 = max(0, y1-15), min(h, y2+15)
+    x1, x2 = max(0, x1-15), min(w, x2+15)
+    
+    face_img = frame[y1:y2, x1:x2]
+    if face_img.size == 0: return "Unknown Person"
+
+    try:
+        # Re-detect face location within the YOLO box for precision
+        face_locations = face_recognition.face_locations(face_img)
+        if not face_locations:
+            return "Unknown Person"
+
+        # Compare with known signatures
+        face_encs = face_recognition.face_encodings(face_img, face_locations)
+
+        for face_encoding in face_encs:
+            distances = face_recognition.face_distance(known_encs, face_encoding)
+            if len(distances) > 0:
+                best_match_idx = np.argmin(distances)
+                # 0.7 Tolerance for maximum flexibility with lighting
+                if distances[best_match_idx] < 0.7:
+                    return known_names[best_match_idx]
+                
+    except Exception:
+        pass
+    return "Unknown Person"
+
+# ============================================================
+# 4. TELEGRAM & ALERT SYSTEM (Direct API Call)
+# ============================================================
+
+def send_telegram_direct(img_path, identity):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    caption = f"🚨 {identity} detected!\nTime: {datetime.now().strftime('%H:%M:%S')}"
+    try:
+        with open(img_path, 'rb') as photo:
+            requests.post(url, data={'chat_id': CHAT_ID, 'caption': caption}, files={'photo': photo})
+    except Exception as e:
+        print(f"Telegram Connection Error: {e}")
+
+def trigger_alert(frame, identity):
+    now = datetime.now().timestamp()
+    # 30-second cooldown per person
+    if identity not in st.session_state.last_alert or now - st.session_state.last_alert[identity] > 30:
+        timestamp = datetime.now().strftime('%H%M%S')
+        img_path = os.path.join("detections", f"{identity}_{timestamp}.jpg")
+        cv2.imwrite(img_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        
+        with open("database/detections.csv", "a", newline="") as f:
+            csv.writer(f).writerow([datetime.now().strftime("%Y-%m-%d"), datetime.now().strftime("%H:%M:%S"), identity])
+        
+        threading.Thread(target=send_telegram_direct, args=(img_path, identity)).start()
+        st.session_state.last_alert[identity] = now
+
+# ============================================================
+# 5. STREAMLIT INTERFACE
+# ============================================================
+
+st.set_page_config(page_title="AI Smart Sentry", layout="wide")
+st.title("🛡️ AI Smart Sentry System")
+
+yolo_model = YOLO("models/yolov8m.pt")
+known_encs, known_names = load_known_faces()
+
+if 'last_alert' not in st.session_state: 
+    st.session_state.last_alert = {}
+
+col_feed, col_info = st.columns([3, 1])
+
+with col_feed:
+    active = st.toggle("Activate Surveillance")
+    video_placeholder = st.image([])
+    
+    if active:
+        cam = cv2.VideoCapture(0)
+        while active:
+            success, frame = cam.read()
+            if not success: break
+            
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = yolo_model.track(frame_rgb, persist=True, verbose=False)
+            
+            for r in results:
+                if r.boxes:
+                    for box in r.boxes:
+                        if yolo_model.names[int(box.cls[0])] == "person" and float(box.conf[0]) > 0.5:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            
+                            identity = identify_person(frame_rgb, [x1, y1, x2, y2], known_encs, known_names)
+                            
+                            color = (0, 255, 0) if identity != "Unknown Person" else (255, 0, 0)
+                            cv2.rectangle(frame_rgb, (x1, y1), (x2, y2), color, 2)
+                            cv2.putText(frame_rgb, f"{identity}", (x1, y1-10), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            
+                            trigger_alert(frame_rgb, identity)
+            
+            video_placeholder.image(frame_rgb)
+        cam.release()
+
+with col_info:
+    st.header("Status")
+    st.success(f"Signatures Active: {len(known_names)}")
+    if st.button("Force Re-scan Folder"):
+        st.cache_resource.clear()
+        st.rerun()
+    
+    st.divider()
+    st.write("Recent Activity:")
+    if os.path.exists("database/detections.csv"):
+        try:
+            log_df = pd.read_csv("database/detections.csv", names=["Date", "Time", "Object"]).tail(5)
+            st.table(log_df)
+        except:
+            st.write("Awaiting detections...")
